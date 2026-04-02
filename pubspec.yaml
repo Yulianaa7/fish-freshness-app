@@ -10,13 +10,23 @@ environment:
 dependencies:
   flutter:
     sdk: flutter
+
+  # Image & Camera
   image_picker: ^1.0.7
-  tflite_flutter: ^0.11.0
   image: ^4.0.17
+
+  # ML / TFLite
+  tflite_flutter: ^0.11.0
+
+  # HTTP & Storage 
+  http: ^1.1.0
+  shared_preferences: ^2.2.3
+
+  # Utilities
+  path_provider: ^2.1.2
   desktop_drop: ^0.4.3
   file_picker: ^8.0.0
   cupertino_icons: ^1.0.8
-  path_provider: ^2.1.2
 
 dev_dependencies:
   flutter_test:
@@ -24,7 +34,6 @@ dev_dependencies:
   flutter_lints: ^6.0.0
 
 flutter:
-
   uses-material-design: true
 
   assets:
