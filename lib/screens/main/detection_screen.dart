@@ -1,650 +1,512 @@
 import 'dart:io';
 import 'dart:typed_data';
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
+import 'package:camera/camera.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:tflite_flutter/tflite_flutter.dart';
 import 'package:image/image.dart' as img;
-import 'package:path_provider/path_provider.dart';
-import '../../constants/app_theme.dart';
 import '../../models/inspection_model.dart';
-import '../../services/api_service.dart';
+import 'history_screen.dart';
+
+class _OL {
+  static const primary = Color(0xFF003366);
+  static const accent = Color(0xFF1DB37E);
+  static const bg = Color(0xFFF8FAFC);
+  static const surface = Colors.white;
+  static const textPrimary = Color(0xFF0D1B2A);
+  static const textSecondary = Color(0xFF64748B);
+  static const danger = Color(0xFFE11D48);
+  static const freshBg = Color(0xFFD1FAE5);
+}
 
 class DetectionScreen extends StatefulWidget {
+  const DetectionScreen({super.key});
+
   @override
   _DetectionScreenState createState() => _DetectionScreenState();
 }
 
 class _DetectionScreenState extends State<DetectionScreen> {
+  CameraController? _controller;
+  Future<void>? _initializeControllerFuture;
+  List<CameraDescription>? cameras;
+  final ImagePicker _picker = ImagePicker();
+
   File? imageFile;
   Interpreter? interpreter;
-  bool _isModelLoaded = false;
   bool _isProcessing = false;
-  bool _isSaving = false;
 
   String? _resultLabel;
   double? _confidence;
   bool? _isFresh;
-
-  final _fishNameCtrl = TextEditingController();
+  String _scanId = "SCAN_ID: 982-A";
+  bool _savedToHistory = false;
 
   final List<String> classes = [
     "eye-fresh",
     "eye-non-fresh",
     "gill-fresh",
-    "gill-non-fresh"
+    "gill-non-fresh",
   ];
 
   @override
   void initState() {
     super.initState();
-    loadModel();
+    _initApp();
+  }
+
+  Future<void> _initApp() async {
+    await _loadModel();
+    await _setupCamera();
+  }
+
+  Future<void> _setupCamera() async {
+    try {
+      cameras = await availableCameras();
+      if (cameras != null && cameras!.isNotEmpty) {
+        _controller = CameraController(
+          cameras![0],
+          ResolutionPreset.high,
+          enableAudio: false,
+        );
+        _initializeControllerFuture = _controller!.initialize();
+        if (mounted) setState(() {});
+      }
+    } catch (e) {
+      debugPrint("Camera Error: $e");
+    }
+  }
+
+  Future<void> _loadModel() async {
+    try {
+      interpreter = await Interpreter.fromAsset('assets/fish_model.tflite');
+    } catch (e) {
+      debugPrint("Model Error: $e");
+    }
+  }
+
+  Future<void> _captureAndAnalyze() async {
+    if (_controller == null ||
+        !_controller!.value.isInitialized ||
+        _isProcessing) return;
+
+    setState(() => _isProcessing = true);
+
+    try {
+      await _initializeControllerFuture;
+      final XFile capturedImage = await _controller!.takePicture();
+      imageFile = File(capturedImage.path);
+      await _runInference(imageFile!);
+    } catch (e) {
+      debugPrint("Capture Error: $e");
+    } finally {
+      setState(() => _isProcessing = false);
+    }
+  }
+
+  Future<void> _pickFromGallery() async {
+    if (_isProcessing) return;
+
+    final XFile? pickedFile = await _picker.pickImage(
+      source: ImageSource.gallery,
+      imageQuality: 90,
+    );
+
+    if (pickedFile != null) {
+      setState(() {
+        imageFile = File(pickedFile.path);
+        _isProcessing = true;
+        _resultLabel = null;
+        _savedToHistory = false;
+      });
+      await _runInference(imageFile!);
+      setState(() => _isProcessing = false);
+    }
+  }
+
+  void _saveToHistory() {
+    if (_resultLabel == null || imageFile == null || _savedToHistory) return;
+
+    final isEye = _resultLabel!.contains('eye');
+
+    final int generatedId = DateTime.now().millisecondsSinceEpoch;
+    final double safeConfidence = (_confidence ?? 0.0).toDouble();
+    final bool safeIsFresh = _isFresh == true;
+    final String now = DateTime.now().toIso8601String();
+
+    final newItem = InspectionModel(
+      id: generatedId,
+      fishName: isEye ? 'Inspeksi Mata' : 'Inspeksi Insang',
+      confidence: safeConfidence,
+      resultLabel: _resultLabel ?? '',
+      isFresh: safeIsFresh,
+      eyeImagePath: isEye ? imageFile!.path : null,
+      gillImagePath: !isEye ? imageFile!.path : null,
+      inspectedAt: now,
+    );
+
+    InspectionStorage.add(newItem);
+
+    setState(() => _savedToHistory = true);
+
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text('✅ $_scanId berhasil disimpan ke histori'),
+        backgroundColor: _OL.accent,
+        behavior: SnackBarBehavior.floating,
+      ),
+    );
+  }
+
+  Future<void> _runInference(File file) async {
+    if (interpreter == null) return;
+
+    // FIX 1: Gunakan readAsBytes() (async) bukan readAsBytesSync() untuk
+    // menghindari blocking UI thread
+    final Uint8List imageData = await file.readAsBytes();
+    img.Image? originalImage = img.decodeImage(imageData);
+
+    if (originalImage == null) {
+      debugPrint("Inference Error: Gagal decode gambar");
+      return;
+    }
+
+    img.Image resizedImage =
+        img.copyResize(originalImage, width: 224, height: 224);
+
+    final inputList = List.generate(
+      1,
+      (_) => List.generate(
+        224,
+        (y) => List.generate(
+          224,
+          (x) {
+            final pixel = resizedImage.getPixel(x, y);
+            return [
+              pixel.r / 255.0,
+              pixel.g / 255.0,
+              pixel.b / 255.0,
+            ];
+          },
+        ),
+      ),
+    );
+
+    final outputList = List.generate(1, (_) => List.filled(4, 0.0));
+
+    interpreter!.run(inputList, outputList);
+
+    final List<double> scores = List<double>.from(outputList[0]);
+    final double maxScore = scores.reduce((a, b) => a > b ? a : b);
+    final int maxIndex = scores.indexOf(maxScore);
+
+    setState(() {
+      _resultLabel = classes[maxIndex];
+      _confidence = maxScore;
+      _isFresh = !_resultLabel!.contains('non');
+      _scanId = "SCAN_ID: ${980 + DateTime.now().second}-A";
+      _savedToHistory = false;
+    });
   }
 
   @override
   void dispose() {
-    _fishNameCtrl.dispose();
+    _controller?.dispose();
+    interpreter?.close();
     super.dispose();
   }
-
-  Future<void> loadModel() async {
-    try {
-      final byteData = await rootBundle.load('assets/fish_model.tflite');
-      final tempDir = await getTemporaryDirectory();
-      final tempFile = File('${tempDir.path}/fish_model.tflite');
-      await tempFile.writeAsBytes(byteData.buffer.asUint8List());
-      interpreter = await Interpreter.fromFile(tempFile);
-      if (mounted) setState(() => _isModelLoaded = true);
-    } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-          content: Text('Gagal memuat model: $e'),
-          backgroundColor: AppColors.nonFresh,
-        ));
-      }
-    }
-  }
-
-  Future<void> pickImage(ImageSource source) async {
-    if (!_isModelLoaded || _isProcessing) return;
-    final pickedFile =
-        await ImagePicker().pickImage(source: source, imageQuality: 85);
-    if (pickedFile == null) return;
-
-    setState(() {
-      imageFile = File(pickedFile.path);
-      _resultLabel = null;
-      _confidence = null;
-      _isFresh = null;
-      _isProcessing = true;
-    });
-    await _runModel();
-  }
-
-  Float32List preprocessImage(File file) {
-    img.Image image = img.decodeImage(file.readAsBytesSync())!;
-    img.Image resized = img.copyResize(image, width: 224, height: 224);
-    Float32List input = Float32List(1 * 224 * 224 * 3);
-    int index = 0;
-    for (int y = 0; y < 224; y++) {
-      for (int x = 0; x < 224; x++) {
-        img.Pixel pixel = resized.getPixel(x, y);
-        input[index++] = pixel.r / 255.0;
-        input[index++] = pixel.g / 255.0;
-        input[index++] = pixel.b / 255.0;
-      }
-    }
-    return input;
-  }
-
-  Future<void> _runModel() async {
-    if (imageFile == null || interpreter == null) {
-      setState(() => _isProcessing = false);
-      return;
-    }
-    try {
-      Float32List input = await Future(() => preprocessImage(imageFile!));
-      var output = List.generate(1, (_) => List.filled(4, 0.0));
-      interpreter!.run(input.reshape([1, 224, 224, 3]), output);
-
-      double maxScore = output[0][0];
-      int maxIndex = 0;
-      for (int i = 1; i < output[0].length; i++) {
-        if (output[0][i] > maxScore) {
-          maxScore = output[0][i];
-          maxIndex = i;
-        }
-      }
-
-      setState(() {
-        _resultLabel = classes[maxIndex];
-        _confidence = maxScore;
-        _isFresh = !_resultLabel!.contains('non');
-        _isProcessing = false;
-      });
-    } catch (e) {
-      setState(() => _isProcessing = false);
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-          content: Text('Error saat memproses: $e'),
-          backgroundColor: AppColors.nonFresh,
-        ));
-      }
-    }
-  }
-
-  Future<void> _saveResult() async {
-    if (_resultLabel == null || imageFile == null) return;
-
-    // Show name dialog
-    showDialog(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-        title: const Text('Simpan Hasil',
-            style: TextStyle(fontWeight: FontWeight.bold)),
-        content: TextField(
-          controller: _fishNameCtrl,
-          decoration: const InputDecoration(
-            labelText: 'Nama Ikan',
-            hintText: 'cth: Ikan Nila, Ikan Lele...',
-            prefixIcon: Icon(Icons.set_meal),
-          ),
-          textCapitalization: TextCapitalization.words,
-        ),
-        actions: [
-          TextButton(
-              onPressed: () => Navigator.pop(ctx),
-              child: const Text('Batal')),
-          ElevatedButton(
-            onPressed: () async {
-              Navigator.pop(ctx);
-              await _doSave();
-            },
-            child: const Text('Simpan'),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Future<void> _doSave() async {
-    if (_resultLabel == null) return;
-    setState(() => _isSaving = true);
-
-    // TODO: Ganti dengan ApiService.saveInspection() saat backend siap
-    await Future.delayed(const Duration(seconds: 1)); // simulasi loading
-    setState(() => _isSaving = false);
-
-    if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-      content: Text('⚠️ Backend belum tersambung. Data tidak disimpan.'),
-      backgroundColor: AppColors.warning,
-    ));
-  }
-
-  void _reset() => setState(() {
-        imageFile = null;
-        _resultLabel = null;
-        _confidence = null;
-        _isFresh = null;
-        _fishNameCtrl.clear();
-      });
-
-  // ─── UI helpers ─────────────────────────────────────
-  String get _partLabel {
-    if (_resultLabel == null) return '';
-    if (_resultLabel!.startsWith('eye')) return 'Mata Ikan';
-    return 'Insang Ikan';
-  }
-
-  String get _freshnessLabel {
-    if (_resultLabel == null) return '';
-    return _isFresh! ? 'Segar' : 'Tidak Segar';
-  }
-
-  Color get _freshnessColor =>
-      (_isFresh ?? false) ? AppColors.fresh : AppColors.nonFresh;
-
-  Color get _freshnessBg =>
-      (_isFresh ?? false) ? AppColors.freshLight : AppColors.nonFreshLight;
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      backgroundColor: AppColors.background,
-      body: CustomScrollView(
-        slivers: [
-          // App bar
-          SliverAppBar(
-            pinned: true,
-            backgroundColor: AppColors.primary,
-            title: const Text(
-              'Deteksi Kesegaran Ikan',
-              textAlign: TextAlign.center,
-            ),
-            centerTitle: true,
-            flexibleSpace: Container(
-              decoration: const BoxDecoration(
-                gradient: LinearGradient(
-                  colors: [AppColors.primaryDark, AppColors.primary],
-                  begin: Alignment.topLeft,
-                  end: Alignment.bottomRight,
-                ),
-              ),
+      backgroundColor: _OL.bg,
+      appBar: AppBar(
+        backgroundColor: Colors.white,
+        elevation: 0,
+        leading: const Icon(Icons.menu, color: _OL.primary),
+        title: const Text(
+          "FRESHNET",
+          style: TextStyle(
+            color: _OL.primary,
+            fontWeight: FontWeight.bold,
+            letterSpacing: 1.2,
+            fontSize: 16,
+          ),
+        ),
+        centerTitle: true,
+      ),
+      body: _resultLabel == null ? _buildCameraView() : _buildResultView(),
+    );
+  }
+
+  Widget _buildCameraView() {
+    return Stack(
+      children: [
+        Positioned.fill(
+          child: FutureBuilder<void>(
+            future: _initializeControllerFuture,
+            builder: (context, snapshot) {
+              if (snapshot.connectionState == ConnectionState.done &&
+                  _controller != null) {
+                return CameraPreview(_controller!);
+              } else {
+                return const Center(child: CircularProgressIndicator());
+              }
+            },
+          ),
+        ),
+        Center(
+          child: Container(
+            width: 260,
+            height: 260,
+            decoration: BoxDecoration(
+              border: Border.all(color: Colors.white, width: 2),
+              borderRadius: BorderRadius.circular(20),
             ),
           ),
-
-          SliverToBoxAdapter(
-            child: Padding(
-              padding: const EdgeInsets.all(20),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.stretch,
-                children: [
-                  // Loading indicator model
-                  if (!_isModelLoaded)
-                    Container(
-                      padding: const EdgeInsets.all(16),
-                      decoration: BoxDecoration(
-                        color: AppColors.warningLight,
-                        borderRadius: BorderRadius.circular(12),
-                        border: Border.all(color: AppColors.warning),
-                      ),
-                      child: Row(children: [
-                        const SizedBox(
-                            width: 18,
-                            height: 18,
-                            child: CircularProgressIndicator(
-                                strokeWidth: 2,
-                                color: AppColors.warning)),
-                        const SizedBox(width: 12),
-                        const Text('Memuat model AI...',
-                            style: TextStyle(color: AppColors.warning)),
-                      ]),
-                    ),
-
-                  if (!_isModelLoaded) const SizedBox(height: 16),
-
-                  // Image area
-                  GestureDetector(
-                    onTap: _isModelLoaded
-                        ? () => _showImageSourceSheet()
-                        : null,
-                    child: Container(
-                      height: 260,
-                      decoration: BoxDecoration(
-                        color: Colors.white,
-                        borderRadius: BorderRadius.circular(20),
-                        border: Border.all(
-                            color: imageFile != null
-                                ? AppColors.primary.withOpacity(0.3)
-                                : AppColors.divider,
-                            width: 2),
-                        boxShadow: [
-                          BoxShadow(
-                              color: Colors.black.withOpacity(0.05),
-                              blurRadius: 10)
-                        ],
-                      ),
-                      child: _isProcessing
-                          ? _buildProcessing()
-                          : imageFile != null
-                              ? _buildImagePreview()
-                              : _buildEmptyState(),
-                    ),
-                  ),
-
-                  const SizedBox(height: 20),
-
-                  // Action buttons
-                  if (_resultLabel == null)
-                    Row(children: [
-                      Expanded(
-                        child: _ActionBtn(
-                          icon: Icons.photo_camera,
-                          label: 'Kamera',
-                          color: AppColors.primary,
-                          onTap: _isModelLoaded
-                              ? () => pickImage(ImageSource.camera)
-                              : null,
-                        ),
-                      ),
-                      const SizedBox(width: 12),
-                      Expanded(
-                        child: _ActionBtn(
-                          icon: Icons.photo_library,
-                          label: 'Galeri',
-                          color: AppColors.primaryLight,
-                          onTap: _isModelLoaded
-                              ? () => pickImage(ImageSource.gallery)
-                              : null,
-                        ),
-                      ),
-                    ]),
-
-                  // Result card
-                  if (_resultLabel != null) ...[
-                    _buildResultCard(),
-                    const SizedBox(height: 16),
-                    Row(children: [
-                      Expanded(
-                        child: OutlinedButton.icon(
-                          onPressed: _reset,
-                          icon: const Icon(Icons.refresh),
-                          label: const Text('Deteksi Lagi'),
-                          style: OutlinedButton.styleFrom(
-                            foregroundColor: AppColors.primary,
-                            side: const BorderSide(color: AppColors.primary),
-                            shape: RoundedRectangleBorder(
-                                borderRadius: BorderRadius.circular(12)),
-                            padding: const EdgeInsets.symmetric(vertical: 14),
-                          ),
-                        ),
-                      ),
-                      const SizedBox(width: 12),
-                      Expanded(
-                        child: ElevatedButton.icon(
-                          onPressed: _isSaving ? null : _saveResult,
-                          icon: _isSaving
-                              ? const SizedBox(
-                                  width: 18,
-                                  height: 18,
-                                  child: CircularProgressIndicator(
-                                      strokeWidth: 2, color: Colors.white))
-                              : const Icon(Icons.save_alt),
-                          label: Text(_isSaving ? 'Menyimpan...' : 'Simpan'),
-                        ),
-                      ),
-                    ]),
-                  ],
-
-                  const SizedBox(height: 24),
-
-                  // Tips card
-                  _buildTipsCard(),
-                ],
-              ),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildEmptyState() {
-    return Column(
-      mainAxisAlignment: MainAxisAlignment.center,
-      children: [
-        Icon(Icons.add_photo_alternate_outlined,
-            size: 64, color: AppColors.textGrey.withOpacity(0.5)),
-        const SizedBox(height: 12),
-        Text('Ambil atau pilih gambar mata/insang ikan',
-            textAlign: TextAlign.center,
-            style: TextStyle(color: AppColors.textGrey, fontSize: 14)),
-        const SizedBox(height: 4),
-        Text('Klik di sini untuk memilih',
-            style: TextStyle(
-                color: AppColors.primary,
-                fontSize: 12,
-                fontWeight: FontWeight.w600)),
-      ],
-    );
-  }
-
-  Widget _buildProcessing() {
-    return Column(
-      mainAxisAlignment: MainAxisAlignment.center,
-      children: [
-        const CircularProgressIndicator(color: AppColors.primary),
-        const SizedBox(height: 16),
-        const Text('Menganalisis gambar...',
-            style:
-                TextStyle(color: AppColors.textGrey, fontSize: 14)),
-      ],
-    );
-  }
-
-  Widget _buildImagePreview() {
-    return ClipRRect(
-      borderRadius: BorderRadius.circular(18),
-      child: Stack(
-        fit: StackFit.expand,
-        children: [
-          Image.file(imageFile!, fit: BoxFit.cover),
-          if (_resultLabel != null)
-            Positioned(
-              top: 12,
-              right: 12,
-              child: Container(
-                padding:
-                    const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-                decoration: BoxDecoration(
-                  color: _freshnessColor,
-                  borderRadius: BorderRadius.circular(20),
-                ),
-                child: Text(_freshnessLabel,
-                    style: const TextStyle(
-                        color: Colors.white,
-                        fontWeight: FontWeight.bold,
-                        fontSize: 13)),
-              ),
-            ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildResultCard() {
-    return Container(
-      padding: const EdgeInsets.all(20),
-      decoration: BoxDecoration(
-        color: _freshnessBg,
-        borderRadius: BorderRadius.circular(16),
-        border: Border.all(color: _freshnessColor.withOpacity(0.3)),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Row(
+        ),
+        Positioned(
+          bottom: 40,
+          left: 0,
+          right: 0,
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.spaceEvenly,
             children: [
-              Icon(_isFresh! ? Icons.check_circle : Icons.cancel,
-                  color: _freshnessColor, size: 28),
-              const SizedBox(width: 10),
-              Text(
-                _freshnessLabel,
-                style: TextStyle(
-                    fontSize: 22,
-                    fontWeight: FontWeight.bold,
-                    color: _freshnessColor),
+              IconButton(
+                onPressed: () {
+                },
+                icon: const Icon(Icons.flash_on, color: Colors.white),
+              ),
+              GestureDetector(
+                onTap: _captureAndAnalyze,
+                child: CircleAvatar(
+                  radius: 42,
+                  backgroundColor: Colors.white30,
+                  child: CircleAvatar(
+                    radius: 38,
+                    backgroundColor: Colors.white,
+                    child: _isProcessing
+                        ? const CircularProgressIndicator(color: _OL.primary)
+                        : const Icon(Icons.camera_alt,
+                            color: Colors.black, size: 36),
+                  ),
+                ),
+              ),
+              IconButton(
+                onPressed: _pickFromGallery,
+                icon: const Icon(Icons.photo_library,
+                    color: Colors.white, size: 28),
               ),
             ],
           ),
-          const SizedBox(height: 12),
-          _InfoRow(label: 'Bagian Ikan', value: _partLabel),
-          const SizedBox(height: 6),
-          _InfoRow(
-              label: 'Confidence',
-              value: '${(_confidence! * 100).toStringAsFixed(1)}%'),
-          const SizedBox(height: 6),
-          _InfoRow(
-              label: 'Status',
-              value: _isFresh!
-                  ? 'Layak dikonsumsi ✅'
-                  : 'Tidak layak dikonsumsi ❌'),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildTipsCard() {
-    return Container(
-      padding: const EdgeInsets.all(16),
-      decoration: BoxDecoration(
-        color: Colors.white,
-        borderRadius: BorderRadius.circular(16),
-        boxShadow: [
-          BoxShadow(color: Colors.black.withOpacity(0.04), blurRadius: 8)
-        ],
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Row(children: [
-            const Icon(Icons.lightbulb_outline,
-                color: AppColors.warning, size: 20),
-            const SizedBox(width: 8),
-            const Text('Tips Pengambilan Gambar',
-                style: TextStyle(
-                    fontWeight: FontWeight.bold, color: AppColors.textDark)),
-          ]),
-          const SizedBox(height: 12),
-          _TipItem('Ambil gambar dengan pencahayaan yang cukup'),
-          _TipItem('Pastikan mata atau insang ikan terlihat jelas'),
-          _TipItem('Hindari gambar yang buram atau terlalu jauh'),
-          _TipItem('Fokuskan pada satu bagian: mata atau insang saja'),
-        ],
-      ),
-    );
-  }
-
-  void _showImageSourceSheet() {
-    showModalBottomSheet(
-      context: context,
-      shape: const RoundedRectangleBorder(
-          borderRadius: BorderRadius.vertical(top: Radius.circular(20))),
-      builder: (_) => Padding(
-        padding: const EdgeInsets.all(24),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            const Text('Pilih Sumber Gambar',
-                style: TextStyle(
-                    fontWeight: FontWeight.bold, fontSize: 16)),
-            const SizedBox(height: 20),
-            Row(
-              mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-              children: [
-                _SourceOption(
-                    icon: Icons.photo_camera,
-                    label: 'Kamera',
-                    onTap: () {
-                      Navigator.pop(context);
-                      pickImage(ImageSource.camera);
-                    }),
-                _SourceOption(
-                    icon: Icons.photo_library,
-                    label: 'Galeri',
-                    onTap: () {
-                      Navigator.pop(context);
-                      pickImage(ImageSource.gallery);
-                    }),
-              ],
-            ),
-          ],
         ),
-      ),
-    );
-  }
-}
-
-class _ActionBtn extends StatelessWidget {
-  final IconData icon;
-  final String label;
-  final Color color;
-  final VoidCallback? onTap;
-
-  const _ActionBtn(
-      {required this.icon,
-      required this.label,
-      required this.color,
-      this.onTap});
-
-  @override
-  Widget build(BuildContext context) {
-    return ElevatedButton.icon(
-      onPressed: onTap,
-      icon: Icon(icon),
-      label: Text(label),
-      style: ElevatedButton.styleFrom(
-        backgroundColor: color,
-        padding: const EdgeInsets.symmetric(vertical: 14),
-        shape:
-            RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-      ),
-    );
-  }
-}
-
-class _InfoRow extends StatelessWidget {
-  final String label;
-  final String value;
-  const _InfoRow({required this.label, required this.value});
-
-  @override
-  Widget build(BuildContext context) {
-    return Row(
-      mainAxisAlignment: MainAxisAlignment.spaceBetween,
-      children: [
-        Text(label,
-            style: const TextStyle(
-                color: AppColors.textGrey, fontSize: 13)),
-        Text(value,
-            style: const TextStyle(
-                fontWeight: FontWeight.w600,
-                fontSize: 13,
-                color: AppColors.textDark)),
       ],
     );
   }
-}
 
-class _TipItem extends StatelessWidget {
-  final String text;
-  const _TipItem(this.text);
-
-  @override
-  Widget build(BuildContext context) {
-    return Padding(
-      padding: const EdgeInsets.only(bottom: 6),
-      child: Row(
+  Widget _buildResultView() {
+    bool fresh = _isFresh ?? true;
+    return SingleChildScrollView(
+      padding: const EdgeInsets.all(20),
+      child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          const Text('• ',
-              style: TextStyle(color: AppColors.primary, fontSize: 16)),
-          Expanded(
-              child: Text(text,
-                  style: const TextStyle(
-                      color: AppColors.textGrey, fontSize: 13))),
+          Container(
+            height: 220,
+            width: double.infinity,
+            decoration: BoxDecoration(
+              borderRadius: BorderRadius.circular(24),
+              image: DecorationImage(
+                image: FileImage(imageFile!),
+                fit: BoxFit.cover,
+              ),
+            ),
+            child: Stack(
+              children: [
+                Positioned(
+                  top: 15,
+                  left: 15,
+                  child: _badge(_scanId, Colors.black54, isSolid: true),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 20),
+          Container(
+            padding: const EdgeInsets.all(20),
+            decoration: BoxDecoration(
+              color: fresh ? _OL.freshBg : const Color(0xFFFFECEC),
+              borderRadius: BorderRadius.circular(24),
+              border: Border.all(
+                color: fresh
+                    ? _OL.accent.withOpacity(0.3)
+                    : _OL.danger.withOpacity(0.3),
+              ),
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    const Text(
+                      "CURRENT STATUS",
+                      style: TextStyle(
+                        fontSize: 12,
+                        color: _OL.textSecondary,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                    _badge("VERIFIED", fresh ? _OL.accent : _OL.danger),
+                  ],
+                ),
+                const SizedBox(height: 12),
+                Text(
+                  fresh ? "Segar" : "Tidak Segar",
+                  style: TextStyle(
+                    fontSize: 36,
+                    fontWeight: FontWeight.bold,
+                    color: fresh ? const Color(0xFF064E3B) : _OL.danger,
+                  ),
+                ),
+                Text(
+                  "Hasil deteksi berdasarkan analisis visual TFLite.",
+                  style: TextStyle(
+                    color: fresh
+                        ? const Color(0xFF064E3B).withOpacity(0.7)
+                        : _OL.danger.withOpacity(0.7),
+                    fontSize: 13,
+                  ),
+                ),
+                const SizedBox(height: 24),
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    const Text(
+                      "CONFIDENCE",
+                      style: TextStyle(
+                        fontSize: 10,
+                        fontWeight: FontWeight.bold,
+                        color: _OL.textPrimary,
+                      ),
+                    ),
+                    Text(
+                      "${((_confidence ?? 0) * 100).toStringAsFixed(1)}%",
+                      style: TextStyle(
+                        fontWeight: FontWeight.bold,
+                        color: fresh ? const Color(0xFF064E3B) : _OL.danger,
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 8),
+                LinearProgressIndicator(
+                  value: _confidence ?? 0,
+                  backgroundColor: fresh
+                      ? Colors.black12
+                      : _OL.danger.withOpacity(0.1),
+                  color: fresh ? _OL.accent : _OL.danger,
+                  minHeight: 8,
+                  borderRadius: BorderRadius.circular(10),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 16),
+          Container(
+            padding: const EdgeInsets.all(16),
+            decoration: BoxDecoration(
+              color: fresh
+                  ? const Color(0xFFE6FFFA)
+                  : const Color(0xFFFFF5F5),
+              borderRadius: BorderRadius.circular(16),
+            ),
+            child: Row(
+              children: [
+                Icon(Icons.restaurant,
+                    color: fresh ? _OL.accent : _OL.danger),
+                const SizedBox(width: 12),
+                Text(
+                  "REKOMENDASI: ${fresh ? "Layak Konsumsi" : "Hindari Konsumsi"}",
+                  style: TextStyle(
+                    fontWeight: FontWeight.bold,
+                    color: fresh ? const Color(0xFF064E3B) : _OL.danger,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 32),
+          SizedBox(
+            width: double.infinity,
+            child: ElevatedButton.icon(
+              onPressed: _savedToHistory ? null : _saveToHistory,
+              icon: Icon(
+                _savedToHistory ? Icons.check : Icons.history,
+                size: 18,
+              ),
+              label: Text(
+                _savedToHistory ? "TERSIMPAN" : "SAVE TO HISTORY",
+                style: const TextStyle(fontWeight: FontWeight.bold),
+              ),
+              style: ElevatedButton.styleFrom(
+                backgroundColor:
+                    _savedToHistory ? Colors.grey : _OL.primary,
+                foregroundColor: Colors.white,
+                padding: const EdgeInsets.symmetric(vertical: 18),
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(16),
+                ),
+              ),
+            ),
+          ),
+          const SizedBox(height: 12),
+          SizedBox(
+            width: double.infinity,
+            child: OutlinedButton(
+              onPressed: () => setState(() {
+                _resultLabel = null;
+                _savedToHistory = false;
+              }),
+              style: OutlinedButton.styleFrom(
+                padding: const EdgeInsets.symmetric(vertical: 16),
+                side: const BorderSide(color: _OL.primary),
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(16),
+                ),
+              ),
+              child: const Text(
+                "RESCAN FISH",
+                style: TextStyle(
+                  color: _OL.primary,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+            ),
+          ),
         ],
       ),
     );
   }
-}
 
-class _SourceOption extends StatelessWidget {
-  final IconData icon;
-  final String label;
-  final VoidCallback onTap;
-  const _SourceOption(
-      {required this.icon, required this.label, required this.onTap});
-
-  @override
-  Widget build(BuildContext context) {
-    return GestureDetector(
-      onTap: onTap,
-      child: Column(children: [
-        Container(
-          padding: const EdgeInsets.all(18),
-          decoration: BoxDecoration(
-            color: AppColors.primary.withOpacity(0.1),
-            shape: BoxShape.circle,
-          ),
-          child: Icon(icon, color: AppColors.primary, size: 32),
+  Widget _badge(String text, Color color, {bool isSolid = false}) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+      decoration: BoxDecoration(
+        color: isSolid ? color : color.withOpacity(0.1),
+        borderRadius: BorderRadius.circular(20),
+        border: Border.all(
+          color: isSolid ? Colors.transparent : color,
         ),
-        const SizedBox(height: 8),
-        Text(label,
-            style: const TextStyle(fontWeight: FontWeight.w600)),
-      ]),
+      ),
+      child: Text(
+        text,
+        style: TextStyle(
+          color: isSolid ? Colors.white : color,
+          fontSize: 10,
+          fontWeight: FontWeight.bold,
+        ),
+      ),
     );
   }
 }

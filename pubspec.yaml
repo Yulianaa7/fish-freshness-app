@@ -14,6 +14,7 @@ dependencies:
   # Image & Camera
   image_picker: ^1.0.7
   image: ^4.0.17
+  camera: ^0.11.0
 
   # ML / TFLite
   tflite_flutter: ^0.11.0
@@ -38,3 +39,7 @@ flutter:
 
   assets:
     - assets/fish_model.tflite
+    - assets/images/fish_eye_guide.jpeg
+    - assets/images/fish_gill_guide.jpeg
+    - assets/images/fish_meat_guide.jpeg
+    - assets/images/profile_photo.jpg
